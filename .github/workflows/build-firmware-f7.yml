@@ -1,0 +1,121 @@
+name: Firmware at GHA F7 only
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      do_upload:
+        description: 'Upload Build Outputs'
+        required: false
+        type: boolean
+      build_name:
+        description: 'Release Build Name'
+        required: false
+        type: string
+
+jobs:
+  build-firmware:
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Let all builds finish even if one fails early
+      fail-fast: false
+      matrix:
+        include:
+          # Board configurations
+         
+          - build-target: proteus_f7
+            folder: config/boards/proteus
+            ini-file: fome_proteus_f7.ini
+
+    steps:
+    - name: Check branch name
+      if: ${{ contains(github.ref_name, '.') }}
+      run: echo '::error::Branch names must not contain ".", this breaks firmware autoupdates.' && exit 1
+
+    - name: Set run condition variables
+      run: |
+        if [ "${{github.repository}}" = "FOME-Tech/fome-fw" ]\
+        && [ "${{github.event_name}}" = "push" ]\
+        && [ "${{github.ref}}" = "refs/heads/master" ]\
+        || [ "${{toJSON(inputs.do_upload)}}" = "true" ]; then
+          echo "full=true" >> $GITHUB_ENV
+          echo "upload=true" >> $GITHUB_ENV
+        elif [ "${{github.event_name}}" = "push" ]\
+        && [ "${{github.ref}}" = "refs/heads/master" ]; then
+          echo "full=true" >> $GITHUB_ENV
+        fi
+
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    # - uses: actions/setup-java@v4
+    #   with:
+    #     distribution: 'zulu'
+    #     java-version: '8'
+
+    # - name: Install multilib, mingw, sshpass and mtools
+    #   working-directory: ./.github/workflows/
+    #   run: |
+    #     sudo ./add-ubuntu-latest-apt-mirrors.sh
+    #     sudo apt-get install gcc-multilib g++-multilib g++-mingw-w64 gcc-mingw-w64 sshpass mtools
+    #     sudo apt-get install zip
+    #     sudo apt-get install dosfstools
+
+    # Build the firmware!
+    - name: Build Firmware
+      run: bash misc/jenkins/compile_other_versions/compile.sh ${{matrix.folder}} ${{matrix.build-target}}
+
+    - name: Check for illegal time conversions
+      working-directory: ./firmware/
+      run: bash check_illegal_conversion.sh
+
+    # Build rusEFI console
+    - name: Build console
+      if: ${{ env.full == 'true' }}
+      run: bash misc/jenkins/build_java_console.sh
+
+    # Build the simulator
+    - name: Build simulator
+      if: ${{ env.full == 'true' }}
+      working-directory: ./simulator/
+      # 'OS="Windows_NT"' allows us to build Windows executable on unix
+      run: OS="Windows_NT" make -j20 PROJECT_BOARD=${{matrix.build-target}} BOARD_DIR=../firmware/${{matrix.folder}} 
+
+    - name: Package Bundle
+      if: ${{ env.full == 'true' }}
+      run: bash misc/jenkins/compile_other_versions/prepare_bundle.sh ${{matrix.build-target}} "${{matrix.ini-file}}" ${{ toJSON(inputs.build_name) }}
+
+    - name: Upload INI to tunes.fome.tech
+      if: ${{ env.full == 'true' && env.upload == 'true' }}
+      uses: hyper-tuner/ini-upload-action@v1
+      continue-on-error: true
+      with:
+        api-url: "${{ secrets.HYPER_TUNER_INI_UPLOAD_URL }}"
+        username: "${{ secrets.HYPER_TUNER_INI_UPLOAD_USERNAME }}"
+        password: "${{ secrets.HYPER_TUNER_INI_UPLOAD_PASSWORD }}"
+        path: ./firmware/tunerstudio/generated/${{matrix.ini-file}}
+        ecosystem: fome
+
+    # If not uploading the full bundle, at least upload the bin+ini so you can test off a PR
+    - name: Upload build bin
+      uses: actions/upload-artifact@v7
+      with:
+        name: fome_${{matrix.build-target}}.bin
+        path: ./firmware/deliver/fome.bin
+
+    - name: Upload ini
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{matrix.ini-file}}
+        path: ./firmware/tunerstudio/generated/${{matrix.ini-file}}
+
+    - name: Upload bundle
+      if: ${{ env.full == 'true' && env.upload == 'true' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: fome_bundle_${{matrix.build-target}}.zip
+        path: ./artifacts/fome_bundle_${{matrix.build-target}}.zip
+        archive: false
